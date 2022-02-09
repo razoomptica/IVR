@@ -1,0 +1,164 @@
+#include <EnableInterrupt.h>
+#include <Servo.h>
+
+#define SERIAL_PORT_SPEED 57600
+#define RC_NUM_CHANNELS  3
+
+#define RC_CH1  0
+#define RC_CH2  1
+#define RC_CH3  2
+
+#define RC_CH1_INPUT  A0
+#define RC_CH2_INPUT  A1
+#define RC_CH3_INPUT  A2
+
+#define PIN_TRIG 12
+#define PIN_ECHO 11
+
+long duration, cm;
+
+Servo ch1;
+Servo ch2;
+
+uint16_t rc_values[RC_NUM_CHANNELS];
+uint32_t rc_start[RC_NUM_CHANNELS];
+volatile uint16_t rc_shared[RC_NUM_CHANNELS];
+
+int ch1_pos;
+int ch2_pos;
+
+int i=0;
+int active=0;
+int arrsize = 5;
+long lenth[] = {300,300,300,300,300};
+
+void rc_read_values() {
+  noInterrupts();
+  memcpy(rc_values, (const void *)rc_shared, sizeof(rc_shared));
+  interrupts();
+}
+
+void calc_input(uint8_t channel, uint8_t input_pin) {
+  if (digitalRead(input_pin) == HIGH) {
+    rc_start[channel] = micros();
+  } else {
+    uint16_t rc_compare = (uint16_t)(micros() - rc_start[channel]);
+    rc_shared[channel] = rc_compare;
+  }
+}
+
+void calc_ch1() { calc_input(RC_CH1, RC_CH1_INPUT); }
+void calc_ch2() { calc_input(RC_CH2, RC_CH2_INPUT); }
+void calc_ch3() { calc_input(RC_CH3, RC_CH3_INPUT); }
+
+void setup() {
+  Serial.begin(SERIAL_PORT_SPEED);
+
+  // Пины, на которых слушаем каналы с приёмника RC
+  pinMode(RC_CH1_INPUT, INPUT);
+  pinMode(RC_CH2_INPUT, INPUT);
+  pinMode(RC_CH3_INPUT, INPUT);
+
+  // Инициализируем прерывания на пинах
+  enableInterrupt(RC_CH1_INPUT, calc_ch1, CHANGE);
+  enableInterrupt(RC_CH2_INPUT, calc_ch2, CHANGE);
+  enableInterrupt(RC_CH3_INPUT, calc_ch3, CHANGE);
+
+  // Эти пины будут управлять сервоприводом и контроллером двигателя
+  ch1.attach(3);
+  ch2.attach(4);
+
+  //Определяем вводы и выводы эходатчика
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+}
+
+void loop() {
+  rc_read_values();
+
+  ch1_pos = rc_values[RC_CH1];
+  if (ch1_pos == 0) ch1_pos = 1500;
+  if (ch1_pos < 1530 && ch1_pos > 1470) ch1_pos = 1500;
+  if (ch1_pos < 1000) ch1_pos = 1000;
+  if (ch1_pos > 2000) ch1_pos = 2000;
+  ch1_pos = 90 + (1500 - ch1_pos) * 45/500;
+
+  // Пересчитываем длинну импульса (1500 +/- 500) в угол поворота сервы (90 +/- 45)
+  // учитывая небольшой дребезг в центре и уход за пределы диапазона
+  ch2_pos = rc_values[RC_CH2];
+  if (ch2_pos == 0) ch2_pos = 1500;
+  if (ch2_pos < 1530 && ch2_pos > 1470) ch2_pos = 1500;
+  if (ch2_pos < 1000) ch2_pos = 1000;
+  if (ch2_pos > 2000) ch2_pos = 2000;
+  // 45/500 в этом выражении позволяет разгоняться на 100% возможности платформы.
+  ch2_pos = 90 + (ch2_pos - 1500) * 15/500;
+  
+  // Проверяем, активна ли система предотвращения столкновения
+  // В зависимости от этого передаем контроллеру двигателя либо положение ручки газа,
+  // либо активируем аварийное торможение платформы
+  if (active == 0) {
+    ch2.write(ch2_pos);
+  } else {
+    // Торможение
+    ch2.write(45);
+  }
+
+
+  ch1.write(ch1_pos);
+
+  if (i++ < 5) {
+    // 4 цикла просто ждем 50 миллисекунд
+    // каждый 5-й цикл определяем расстояние до препядствия
+    delay(50);
+  } else {
+    // Сбрасываем счетчик циклов
+    i = 0;
+    // Сначала генерируем короткий импульс длительностью 2-5 микросекунд.
+    digitalWrite(PIN_TRIG, LOW);
+    delayMicroseconds(5);
+    digitalWrite(PIN_TRIG, HIGH);
+    // Выставив высокий уровень сигнала, ждем около 10 микросекунд. В этот момент датчик будет посылать сигналы с частотой 40 КГц.
+    delayMicroseconds(10);
+    digitalWrite(PIN_TRIG, LOW);
+    //  Время задержки акустического сигнала на эхолокаторе.
+    duration = pulseIn(PIN_ECHO, HIGH);
+    // Теперь осталось преобразовать время в расстояние
+    cm = (duration / 2) / 29.1;
+    // Заполняем массив с последними 5-ю измеренными расстояниями
+    // 5 значений нужно для рассчета скорости и ускорения платформы
+    for (int k = arrsize; k > 0; k--) {
+      lenth[k] = lenth[k-1];
+    }
+    lenth[0] = cm;
+    // Решаем, пора ли вмешиваться в скорость платформы
+    // Вмешиваемся, если скорость ненулевая и расстояние до препядствия критическое
+    // В этом случае устанавливаем флаг active
+    if (active == 0 && lenth[0] < 100 && lenth[0] != lenth[1]) {
+      active = 1;
+    }
+    // Решаем, пора ли передать управление платформой оператору
+    // Для этого скорость должна быть нулевой и ручка газа в нейтральном положении
+    if (active == 1 && ch2_pos == 90) {
+      active = 0;
+    }
+    Serial.print("Расстояние до объекта: ");
+    Serial.print(cm);
+    Serial.print(" см.");
+    Serial.print(" массив: {");
+    Serial.print(lenth[0]);
+    Serial.print(",");
+    Serial.print(lenth[1]);
+    Serial.print(",");
+    Serial.print(lenth[2]);
+    Serial.print(",");
+    Serial.print(lenth[3]);
+    Serial.print(",");
+    Serial.print(lenth[4]);
+    Serial.print("}");
+    
+    Serial.print("active:"); Serial.print(active); Serial.print("\t");
+    Serial.print("CH1:"); Serial.print(ch1_pos); Serial.print("\t");
+    Serial.print("CH2:"); Serial.print(ch2_pos); Serial.print("\t");
+    Serial.print("CH3:"); Serial.println(rc_values[RC_CH3]);
+  }
+}
